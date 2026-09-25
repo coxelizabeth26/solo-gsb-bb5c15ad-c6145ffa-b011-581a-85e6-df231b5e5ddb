@@ -68,6 +68,24 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 `created_at <= at` 回放、时间线按 `created_at` 排序时，记录所处阶段与它被
 接受的阶段始终一致。
 
+**揭示与截止后结算按同一把事件行锁串行化**：单条揭示、批量揭示与永久结算
+都在事务入口先对事件行执行 `SELECT … FOR UPDATE` 取得**同一把事件行锁**，
+并在**取得锁之后**才读取该请求唯一的一次服务端 UTC（同时用于阶段判定与
+`created_at`）。由此消除截止边界上的交错失真——揭示在截止前通过检查、尚未
+提交时，结算无法插入把该承诺计为未揭示：
+
+- **揭示先取得锁**：它按揭示期内的那次读数获准，先提交再放锁；随后取得锁的
+  结算在同一事务内统计得到这条已提交的合法揭示，固化计数与存库记录一致；
+- **结算先取得锁**：截止后完成固化再放锁；随后取得锁的揭示读到的唯一次 UTC
+  必已不早于 `reveal_deadline`，按 `409 REVEAL_PHASE_CLOSED` 拒绝、回滚且
+  **不落库任何揭示**（批量揭示同样整批回滚）。
+
+加锁顺序恒为「事件行 → 承诺行」（批量揭示在事件锁内再对命中的承诺加行锁），
+不存在反向加锁路径，因此不会死锁；「批量揭示全批回滚」「结算仅永久确认一次」
+语义不变。SQLite（本地测试）将 `FOR UPDATE` 降级为普通查询，PostgreSQL
+（Compose 生产环境）上行锁与唯一约束共同保证上述并发正确性。
+
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -578,10 +596,13 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 列表为空或超过 100 项、请求体结构错误（如项不是对象、缺少 `original_text`
 或 `salt`、字段类型错误）返回 422；事件不存在返回 `404 EVENT_NOT_FOUND`，
 以上情形均不产生任何写入。批量端点与单个揭示端点共享同一套存储与唯一约束：
-**并发下仅首次揭示生效**——预检阶段对命中的承诺加行锁（PostgreSQL），
-提交阶段再由 `reveals.commitment_id` 唯一约束兜底，竞争落败的整批请求回滚并
-收到逐项 `DUPLICATE_REVEAL` 清单。整批的阶段判定与各条揭示 `created_at`
-取自**请求入口的同一 UTC 时刻**（详见上文「事件生命周期」），返回记录的
+**并发下仅首次揭示生效**——两个揭示入口与永久结算先共用**同一把事件行锁**
+串行（取得事件锁后才做那唯一次阶段读数），预检阶段在事件锁内再对命中的承诺
+加行锁（PostgreSQL），提交阶段由 `reveals.commitment_id` 唯一约束兜底，
+竞争落败的整批请求回滚并收到逐项 `DUPLICATE_REVEAL` 清单；截止后先完成的
+结算持锁期间揭示排队，放锁后揭示按 `REVEAL_PHASE_CLOSED` 整批拒绝、不落库，
+反之先提交的合法揭示必被随后的结算统计。整批的阶段判定与各条揭示 `created_at`
+取自**取得事件锁后的同一 UTC 时刻**（详见上文「事件生命周期」），返回记录的
 揭示时间全部相等，且不会出现「揭示期内获准、记录却落在 closed 阶段」的情况。
 
 ## 事件承诺集合证明（Merkle）
@@ -731,6 +752,13 @@ curl -s -X POST http://localhost:8000/utils/merkle-proof/verify \
 | `correct_count` | 已揭示且 `original_text == standard_result` 的承诺数 |
 | `incorrect_count` | 已揭示但原文与标准结果不相等的承诺数 |
 | `unrevealed_count` | 承诺存在但从未揭示（含逾期未能揭示）的数量 |
+
+**与揭示按同一把事件行锁串行（截止边界不失真）**：结算与单条 / 批量揭示
+都先取得事件行的 `SELECT … FOR UPDATE` 锁，再读唯一一次服务端 UTC 并在同一
+事务内完成统计与写入。因此揭示在截止前通过检查却尚未提交时，结算无法抢先
+把该承诺固化为未揭示——揭示先持锁则它先提交并被结算计入；结算先持锁（截止后）
+则其后取得锁的揭示读到的时钟必已 closed，被 `409 REVEAL_PHASE_CLOSED` 拒绝且
+不落库。固化的三个计数与 `reveals` 表存库记录始终一致。
 
 ```bash
 # closed 阶段提交标准结果（200；计数在确认时固化）
@@ -1120,6 +1148,7 @@ tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制
 tests/test_extend_same_timestamp.py # 同刻连续延长：按延长链新截止时间排序的快照、幂等重放与时间线回归
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
+tests/test_reveal_settlement_concurrency.py # 揭示（单条/批量）与结算截止边界并发：事件行锁串行、先提交必计入、结算先完成则后到揭示拒绝不落库
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
 tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定、命中排名、无效/未揭示分类与只读
 tests/test_calibration_report.py # 跨事件概率校准：严格概率解析、Brier 均分、十分箱边界与五成双量化

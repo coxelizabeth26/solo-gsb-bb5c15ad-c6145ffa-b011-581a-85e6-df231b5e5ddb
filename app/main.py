@@ -254,6 +254,31 @@ def get_event_or_404(db: Session, event_id: UUID) -> Event:
     return event
 
 
+def lock_event_for_update(db: Session, event_id: UUID) -> Event:
+    """取事件行级写锁并返回事件（不存在 -> 404 EVENT_NOT_FOUND）。
+
+    单条揭示、批量揭示与永久结算共用这**同一把事件行锁**串行化：调用方
+    必须在**取得锁之后**才读取那一次服务端 UTC 时刻并据此做阶段判定与写
+    ``created_at``。由此消除「揭示在截止前通过阶段检查、尚未提交，截止后
+    结算先把该承诺计为未揭示，随后揭示仍成功落库」的交错：
+
+      - 揭示先取得锁：它的单次读数尚在揭示期内，正常提交后才放锁；随后
+        取得锁的结算在同一事务内统计得到这条已提交的合法揭示；
+      - 结算先取得锁：截止后完成固化并提交；随后取得锁的揭示读到的唯一
+        一次时钟必已不早于 reveal_deadline，按 REVEAL_PHASE_CLOSED 拒绝，
+        回滚且不落库任何揭示。
+
+    锁顺序恒为「事件行 -> 承诺行」（批量揭示在事件锁内再锁承诺行），
+    不存在反向加锁路径，因此不会死锁。SQLite 不支持行锁，``FOR UPDATE``
+    被方言降级为普通查询（本地测试环境）；PostgreSQL（Compose 生产环境）
+    上由本事件行锁与 reveals/settlements 唯一约束共同保证并发正确性。
+    """
+    event = db.query(Event).filter(Event.id == event_id).with_for_update().first()
+    if event is None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {event_id} 不存在")
+    return event
+
+
 def event_out(event: Event, db: Session, now: datetime) -> EventOut:
     commitment_count = db.query(Commitment).filter(Commitment.event_id == event.id).count()
     reveal_count = db.query(Reveal).filter(Reveal.event_id == event.id).count()
@@ -1001,19 +1026,24 @@ def list_commitments(event_id: UUID, db: Session = Depends(get_db)):
 
 @app.post("/events/{event_id}/reveals", status_code=201, response_model=RevealOut)
 def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(get_db)):
-    event = get_event_or_404(db, event_id)
-    # 单次读数：准入判定与本条揭示 created_at 共用同一时刻，模型默认值
-    # 不再二次读数，避免获准揭示的记录被记到 closed 阶段
+    # 与批量揭示、永久结算共用同一把事件行锁串行化：先取得事件行锁，再读
+    # 那唯一一次服务端 UTC——若结算先持锁并在截止后完成，本请求放锁后读到
+    # 的时刻必已 closed，将在下方按 REVEAL_PHASE_CLOSED 拒绝且不落库。
+    event = lock_event_for_update(db, event_id)
+    # 单次读数：取得事件锁后的此刻同时用于准入判定与本条揭示 created_at，
+    # 模型默认值不再二次读数，避免获准揭示的记录被记到 closed 阶段
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     reveal_dl = as_utc(event.reveal_deadline)
     if now < commit_dl:
+        db.rollback()
         raise api_error(
             409,
             "REVEAL_PHASE_NOT_STARTED",
             f"揭示期自 {commit_dl.isoformat()} 开始，当前服务端时间 {now.isoformat()}，提前揭示被拒绝",
         )
     if now >= reveal_dl:
+        db.rollback()
         raise api_error(
             409,
             "REVEAL_PHASE_CLOSED",
@@ -1027,12 +1057,14 @@ def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(g
         .first()
     )
     if commitment is None:
+        db.rollback()
         raise api_error(
             409,
             NO_MATCHING_COMMITMENT,
             "原文与盐重算的哈希不匹配本事件中的任何承诺",
         )
     if commitment.reveal is not None:
+        db.rollback()
         raise api_error(
             409,
             DUPLICATE_REVEAL,
@@ -1088,24 +1120,32 @@ def submit_reveals_batch(
     格式非法优先于后续判定；冲突清单按下标升序，每个下标至多一项。
     全部通过时按输入顺序在同一事务中创建，并以相同顺序返回记录。
 
-    并发下「仅首次揭示生效」由两重机制保证：预检阶段对命中的承诺加行锁
-    （PostgreSQL），写入阶段由 reveals.commitment_id 唯一约束兜底——
-    竞争落败的事务整体回滚，不留下部分揭示。
+    并发下「仅首次揭示生效」由两重机制保证：预检阶段先取**事件行锁**
+    （与单条揭示、永久结算共用，按「事件行 -> 承诺行」的固定顺序再加
+    承诺行锁），写入阶段由 reveals.commitment_id 唯一约束兜底——
+    竞争落败的事务整体回滚，不留下部分揭示。事件行锁同时串行化揭示与
+    截止后结算：截止后先完成的结算固化计数，随后取得事件锁的批量揭示
+    读到的唯一次时钟必已 closed，按 REVEAL_PHASE_CLOSED 整批拒绝、回滚
+    且不落库；反之先提交的合法揭示会被随后的结算统计在内。
     """
-    event = get_event_or_404(db, event_id)
-    # 单次读数：准入判定与整批揭示的 created_at 共用同一时刻——批内各条
-    # 记录时间戳相同，模型默认值不再逐项二次读数，避免获准揭示的记录被
-    # 记到 closed 阶段；冲突依旧整体回滚
+    # 先取事件行锁（与单条揭示、结算同一把锁），再读唯一一次服务端 UTC，
+    # 保证与截止后结算严格串行，且不会在持锁等待期间用旧时钟做阶段判定
+    event = lock_event_for_update(db, event_id)
+    # 单次读数：取得事件锁后的此刻同时用于准入判定与整批揭示的 created_at
+    # ——批内各条记录时间戳相同，模型默认值不再逐项二次读数，避免获准揭示
+    # 的记录被记到 closed 阶段；冲突依旧整体回滚
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     reveal_dl = as_utc(event.reveal_deadline)
     if now < commit_dl:
+        db.rollback()
         raise api_error(
             409,
             "REVEAL_PHASE_NOT_STARTED",
             f"揭示期自 {commit_dl.isoformat()} 开始，当前服务端时间 {now.isoformat()}，提前揭示被拒绝",
         )
     if now >= reveal_dl:
+        db.rollback()
         raise api_error(
             409,
             "REVEAL_PHASE_CLOSED",
@@ -1326,11 +1366,16 @@ def settle_event(event_id: UUID, payload: SettlementCreate, db: Session = Depend
         409 SETTLEMENT_ALREADY_CONFIRMED，**既有结果不被改写**，响应在
         detail.existing 中回显首次结算；并发下由 settlements.event_id
         唯一约束兜底。
+
+    与单条 / 批量揭示共用同一把事件行锁：先 ``SELECT ... FOR UPDATE``
+    取得事件行锁，再读唯一一次服务端 UTC 做阶段判定与结算 created_at，
+    并在同一事务内统计揭示。因此截止边界上与揭示严格串行——先取得锁的
+    揭示若按当时（揭示期内）读数获准，必会在本事务统计前提交并被计入；
+    本结算先取得锁时，其后取得锁的揭示读到的时钟必已不早于
+    reveal_deadline，会被拒绝且不落库。固化计数与存库揭示永不矛盾。
     """
-    # 行锁串行化并发结算：校验与写入在同一事务内完成
-    event = db.query(Event).filter(Event.id == event_id).with_for_update().first()
-    if event is None:
-        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {event_id} 不存在")
+    # 行锁串行化并发结算，并与两种揭示入口串行：校验与写入在同一事务内完成
+    event = lock_event_for_update(db, event_id)
 
     existing = (
         db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
